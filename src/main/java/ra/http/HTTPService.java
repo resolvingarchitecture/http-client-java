@@ -112,11 +112,10 @@ public class HTTPService extends NetworkService {
     protected ConnectionSpec httpSpec;
     protected OkHttpClient httpClient;
 
-    protected ConnectionSpec httpsCompatibleSpec;
-    protected OkHttpClient httpsCompatibleClient;
-
     protected ConnectionSpec httpsStrongSpec;
-    protected OkHttpClient httpsStrongClient;
+    protected volatile OkHttpClient httpsStrongClient;
+    private boolean trustAllCerts;
+    private SSLContext trustAllSSLContext;
 
     protected Properties config;
 
@@ -273,6 +272,7 @@ public class HTTPService extends NetworkService {
         long end = 0L;
         if(url.toString().startsWith("https:")) {
             LOG.info("Sending https request, host="+url.getHost());
+            ensureHttpsStrongClient();
 //            if(trustedHosts.contains(url.getHost())) {
             try {
 //                    LOG.info("Trusted host, using compatible connection...");
@@ -290,10 +290,7 @@ public class HTTPService extends NetworkService {
             }
         } else {
             LOG.info("Sending http request, host="+url.getHost());
-            if(httpClient == null) {
-                LOG.severe("httpClient was not set up.");
-                m.addErrorMessage("httpClient was not set up.");
-            }
+            ensureHttpClient();
             try {
                 start = new Date().getTime();
                 response = httpClient.newCall(req).execute();
@@ -419,8 +416,7 @@ public class HTTPService extends NetworkService {
     }
 
     public boolean connect() {
-        boolean trustAllCerts = "true".equals(config.get(RA_HTTP_CLIENT_TRUST_ALL));
-        SSLContext trustAllSSLContext = null;
+        trustAllCerts = "true".equals(config.get(RA_HTTP_CLIENT_TRUST_ALL));
         try {
             if (trustAllCerts) {
                 LOG.info("Initialize SSLContext with trustallcerts...");
@@ -440,66 +436,15 @@ public class HTTPService extends NetworkService {
             httpSpec = new ConnectionSpec
                     .Builder(ConnectionSpec.CLEARTEXT)
                     .build();
-            if (proxy == null) {
-                LOG.info("Setting up http client...");
-                httpClient = new OkHttpClient.Builder()
-                        .protocols(Arrays.asList(Protocol.HTTP_1_1, Protocol.HTTP_2))
-                        .connectionSpecs(Collections.singletonList(httpSpec))
-                        .retryOnConnectionFailure(true)
-                        .followRedirects(true)
-                        .build();
-            } else {
-                LOG.info("Setting up http client with proxy...");
-                httpClient = new OkHttpClient.Builder()
-                        .protocols(Arrays.asList(Protocol.HTTP_1_1, Protocol.HTTP_2))
-                        .connectionSpecs(Arrays.asList(httpSpec))
-                        .retryOnConnectionFailure(true)
-                        .followRedirects(true)
-                        .proxy(proxy)
-                        .build();
-            }
+            // httpClient itself is NOT built here - see ensureHttpClient()/ensureHttpsStrongClient():
+            // OkHttpClient.Builder.build() was observed hanging unpredictably (seconds to indefinitely)
+            // when called concurrently with other services' (I2P/BitcoinJ) own heavy startup-time
+            // classloading/crypto init on a freshly booted container - reproduced with both the
+            // CLEARTEXT (this) and TLS builders, so it isn't SSL/SecureRandom-specific. Deferring
+            // every OkHttpClient build to first actual send avoids racing that startup burst.
 
             LOG.info("Setting https.protocols to system property...");
             System.setProperty("https.protocols", "TLSv1,TLSv1.1,TLSv1.2,TLSv1.3");
-
-            httpsCompatibleSpec = new ConnectionSpec
-                    .Builder(ConnectionSpec.COMPATIBLE_TLS)
-//                    .supportsTlsExtensions(true)
-//                    .allEnabledTlsVersions()
-//                    .allEnabledCipherSuites()
-                    .build();
-
-            if (proxy == null) {
-                LOG.info("Setting up https client...");
-                if (trustAllCerts) {
-                    LOG.info("Trust All Certs HTTPS Compatible Client building...");
-                    httpsCompatibleClient = new OkHttpClient.Builder()
-                            .sslSocketFactory(trustAllSSLContext.getSocketFactory(), trustAllX509TrustManager)
-                            .hostnameVerifier(trustAllHostnameVerifier)
-                            .build();
-                } else {
-                    LOG.info("Standard HTTPS Compatible Client building...");
-                    httpsCompatibleClient = new OkHttpClient.Builder()
-                            .connectionSpecs(Arrays.asList(httpsCompatibleSpec))
-                            .build();
-                }
-            } else {
-                LOG.info("Setting up https client with proxy...");
-                if (trustAllCerts) {
-                    LOG.info("Trust All Certs HTTPS Compatible Client with Proxy building...");
-                    httpsCompatibleClient = new OkHttpClient.Builder()
-                            .sslSocketFactory(trustAllSSLContext.getSocketFactory(), trustAllX509TrustManager)
-                            .hostnameVerifier(trustAllHostnameVerifier)
-                            .proxy(proxy)
-                            .build();
-                } else {
-                    LOG.info("Standard HTTPS Compatible Client with Proxy building...");
-                    httpsCompatibleClient = new OkHttpClient.Builder()
-                            .connectionSpecs(Arrays.asList(httpsCompatibleSpec))
-                            .proxy(proxy)
-                            .build();
-                }
-            }
 
             httpsStrongSpec = new ConnectionSpec
                     .Builder(ConnectionSpec.MODERN_TLS)
@@ -509,48 +454,15 @@ public class HTTPService extends NetworkService {
                             CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
                             CipherSuite.TLS_DHE_RSA_WITH_AES_128_GCM_SHA256)
                     .build();
-
-            if (proxy == null) {
-                LOG.info("Setting up strong https client...");
-                if (trustAllCerts) {
-                    LOG.info("Trust All Certs Strong HTTPS Compatible Client building...");
-                    httpsStrongClient = new OkHttpClient.Builder()
-                            .connectionSpecs(Collections.singletonList(httpsStrongSpec))
-                            .retryOnConnectionFailure(true)
-                            .followSslRedirects(true)
-                            .sslSocketFactory(trustAllSSLContext.getSocketFactory(), trustAllX509TrustManager)
-                            .hostnameVerifier(trustAllHostnameVerifier)
-                            .build();
-                } else {
-                    LOG.info("Standard Strong HTTPS Compatible Client building...");
-                    httpsStrongClient = new OkHttpClient.Builder()
-                            .connectionSpecs(Collections.singletonList(httpsStrongSpec))
-                            .retryOnConnectionFailure(true)
-                            .followSslRedirects(true)
-                            .build();
-                }
-            } else {
-                LOG.info("Setting up strong https client with proxy...");
-                if (trustAllCerts) {
-                    LOG.info("Trust All Certs Strong HTTPS Compatible Client with Proxy building...");
-                    httpsStrongClient = new OkHttpClient.Builder()
-                            .connectionSpecs(Collections.singletonList(httpsStrongSpec))
-                            .retryOnConnectionFailure(true)
-                            .followSslRedirects(true)
-                            .sslSocketFactory(trustAllSSLContext.getSocketFactory(), trustAllX509TrustManager)
-                            .hostnameVerifier(trustAllHostnameVerifier)
-                            .proxy(proxy)
-                            .build();
-                } else {
-                    LOG.info("Standard Strong HTTPS Compatible Client with Proxy building...");
-                    httpsStrongClient = new OkHttpClient.Builder()
-                            .connectionSpecs(Collections.singletonList(httpsStrongSpec))
-                            .retryOnConnectionFailure(true)
-                            .followSslRedirects(true)
-                            .proxy(proxy)
-                            .build();
-                }
-            }
+            // httpsStrongClient itself is NOT built here: it requires SSLContext.init(null, tm, null),
+            // which reads a fresh SecureRandom seed on first use - fine in general, but on a freshly
+            // booted container this can block for an unpredictable stretch (found by decompiling
+            // OkHttpClient.Builder.build() and instrumenting each chained call - only .build() itself
+            // never returned - while other services, e.g. I2P/BitcoinJ, are concurrently doing their
+            // own heavy crypto init at startup). Most HTTPService consumers (e.g. Tor's SOCKS-proxied
+            // hidden-service traffic) never actually send an https: URL, so building this eagerly
+            // during connect() risked stalling startup for no benefit. Built lazily on first real
+            // https: send instead - see ensureHttpsStrongClient(), called from sendOut().
 
         } catch (Exception e) {
             LOG.warning("Exception caught launching HTTP Client Service: " + e.getLocalizedMessage());
@@ -562,12 +474,45 @@ public class HTTPService extends NetworkService {
         return true;
     }
 
+    private synchronized void ensureHttpClient() {
+        if (httpClient != null) return;
+        LOG.info("Setting up http client" + (proxy == null ? "" : " with proxy") + "...");
+        OkHttpClient.Builder b = new OkHttpClient.Builder()
+                .protocols(Arrays.asList(Protocol.HTTP_1_1, Protocol.HTTP_2))
+                .connectionSpecs(Collections.singletonList(httpSpec))
+                .retryOnConnectionFailure(true)
+                .followRedirects(true);
+        if (proxy != null) b = b.proxy(proxy);
+        httpClient = b.build();
+    }
+
+    private synchronized void ensureHttpsStrongClient() {
+        if (httpsStrongClient != null) return;
+        if (trustAllCerts) {
+            LOG.info("Trust All Certs Strong HTTPS Compatible Client " + (proxy == null ? "" : "with Proxy ") + "building...");
+            OkHttpClient.Builder b = new OkHttpClient.Builder()
+                    .connectionSpecs(Collections.singletonList(httpsStrongSpec))
+                    .retryOnConnectionFailure(true)
+                    .followSslRedirects(true)
+                    .sslSocketFactory(trustAllSSLContext.getSocketFactory(), trustAllX509TrustManager)
+                    .hostnameVerifier(trustAllHostnameVerifier);
+            if (proxy != null) b = b.proxy(proxy);
+            httpsStrongClient = b.build();
+        } else {
+            LOG.info("Standard Strong HTTPS Compatible Client " + (proxy == null ? "" : "with Proxy ") + "building...");
+            OkHttpClient.Builder b = new OkHttpClient.Builder()
+                    .connectionSpecs(Collections.singletonList(httpsStrongSpec))
+                    .retryOnConnectionFailure(true)
+                    .followSslRedirects(true);
+            if (proxy != null) b = b.proxy(proxy);
+            httpsStrongClient = b.build();
+        }
+    }
+
     public boolean disconnect() {
         // Tear down clients and their specs
         httpClient = null;
         httpSpec = null;
-        httpsCompatibleClient = null;
-        httpsCompatibleSpec = null;
         httpsStrongClient = null;
         httpsStrongSpec = null;
         updateNetworkStatus(NetworkStatus.DISCONNECTED);
