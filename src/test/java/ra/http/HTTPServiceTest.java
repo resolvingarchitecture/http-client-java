@@ -99,4 +99,23 @@ public class HTTPServiceTest {
         Assert.assertEquals("<html><body>HTTPServiceTest Available</body></html>", html);
     }
 
+    /**
+     * Real, not assumed: connects directly (bypassing {@code sendOut}, which discards response
+     * headers) to confirm Jetty's default "Server: Jetty(&lt;version&gt;)" response header -
+     * which {@code HTTPService.launch()} used to leave enabled - is actually suppressed, not
+     * just believed to be based on the {@code setSendServerVersion(false)} call site.
+     */
+    @Test
+    public void serverHeaderNotLeakedTest() throws Exception {
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
+                new URL("http://localhost:8099/test").openConnection();
+        try {
+            conn.getResponseCode();
+            Assert.assertNull("Server header should be suppressed - see launch()'s HttpConfiguration setup",
+                    conn.getHeaderField("Server"));
+        } finally {
+            conn.disconnect();
+        }
+    }
+
 }

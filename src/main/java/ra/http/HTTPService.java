@@ -2,6 +2,7 @@ package ra.http;
 
 import okhttp3.*;
 import org.eclipse.jetty.server.Handler;
+import org.eclipse.jetty.server.HttpConnectionFactory;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.handler.ContextHandler;
 import org.eclipse.jetty.server.handler.DefaultHandler;
@@ -59,6 +60,17 @@ public class HTTPService extends NetworkService {
     public static final String RA_HTTP_CLIENT_TRUST_ALL = "ra.http.client.trustallcerts";
 
     public static int SESSION_INACTIVITY_INTERVAL = 60 * 60; // 60 minutes
+
+    /**
+     * Used for every outbound request whose caller hasn't set its own {@code
+     * Envelope.HEADER_USER_AGENT} - see {@link #sendOut} for why this exists at all (OkHttp
+     * otherwise injects its own "okhttp/&lt;version&gt;" string). A generic, widely-shared value
+     * - deliberately not this project's own name/version, and deliberately a fixed string rather
+     * than reflecting the actual JVM/OS - matching Tor Browser's own practice of giving every user
+     * an identical, unremarkable fingerprint rather than a unique or software-identifying one.
+     */
+    public static final String DEFAULT_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
     /**
      * Configuration of Servers in the form:
@@ -187,7 +199,20 @@ public class HTTPService extends NetworkService {
         }
         if(h.containsKey(Envelope.HEADER_USER_AGENT) && h.get(Envelope.HEADER_USER_AGENT) != null) {
             hStr.put(Envelope.HEADER_USER_AGENT, (String) h.get(Envelope.HEADER_USER_AGENT));
+        } else {
+            // Without this, OkHttp's BridgeInterceptor injects "okhttp/<version>" as a default
+            // User-Agent whenever the request has none - confirmed directly against the actual
+            // bytecode (okhttp3.internal.Version.userAgent()/BridgeInterceptor), not assumed. That
+            // identifies this exact library+version to every destination and any on-path observer
+            // (a real fingerprinting signal for a caller like TORClientService routing over Tor,
+            // where standing out from other traffic is itself a privacy leak) - a generic,
+            // widely-shared browser UA is the standard mitigation (the same principle Tor Browser
+            // itself uses: every user presents an identical, unremarkable fingerprint).
+            hStr.put(Envelope.HEADER_USER_AGENT, DEFAULT_USER_AGENT);
         }
+        // Also OkHttp-injected if absent (transparent gzip) - explicit here so it's a documented,
+        // reviewed default rather than a silent library behavior.
+        hStr.putIfAbsent("Accept-Encoding", "gzip");
 
         ByteBuffer bodyBytes = null;
         CacheControl cacheControl = null;
@@ -592,6 +617,18 @@ public class HTTPService extends NetworkService {
         }
 
         server = new Server(new InetSocketAddress(addrParam, port));
+        // Jetty's default HttpConfiguration sends "Server: Jetty(<version>)" on every response -
+        // confirmed directly (no HttpConfiguration was ever set here before, so the compiled-in
+        // default applies). For a listener backing a Tor/I2P hidden service, that leaks exactly
+        // what server software (and version) this node runs to every peer it talks to - a real
+        // fingerprinting signal with no offsetting benefit, so it's suppressed unconditionally
+        // here rather than only for Tor's own use of this class.
+        for (org.eclipse.jetty.server.Connector connector : server.getConnectors()) {
+            HttpConnectionFactory httpConnectionFactory = connector.getConnectionFactory(HttpConnectionFactory.class);
+            if (httpConnectionFactory != null) {
+                httpConnectionFactory.getHttpConfiguration().setSendServerVersion(false);
+            }
+        }
         servers.put(addrPort, server);
 
         HandlerCollection serverHandlers = new HandlerCollection();
